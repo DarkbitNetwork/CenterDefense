@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Center Defense</title>
+<style>
+  :root{--bg:#111;--panel:#1a1a1a;--muted:#bbb}
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Arial,Helvetica,sans-serif}
+  #gameCanvas{display:block;width:100vw;height:100vh;background:linear-gradient(#0f0f14,#15151a)}
+  #ui{position:fixed;left:50%;transform:translateX(-50%);top:10px;text-align:center;z-index:10}
+  #roundText{font-weight:700;margin-bottom:6px}
+  #hud{display:flex;gap:16px;align-items:center;justify-content:center}
+  .item-label{cursor:default;font-weight:600}
+  #choices{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;display:none;z-index:11}
+  .choice{display:inline-block;padding:10px 18px;background:#222;border:1px solid #444;border-radius:6px;margin:6px;cursor:pointer}
+  .choice:hover{background:#2a2a2a}
+  #enemyCounter{font-size:14px;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="roundText">Round 1</div>
+  <div id="hud">
+    <div id="labels">
+      <span id="label-bomb" class="item-label">Bomb: <span id="count-bomb">0</span></span>
+      &nbsp;•&nbsp;
+      <span id="label-jammer" class="item-label">Jammer: <span id="count-jammer">0</span></span>
+      &nbsp;•&nbsp;
+      <span id="label-turret" class="item-label">Turret: <span id="count-turret">0</span></span>
+    </div>
+  </div>
+  <div id="enemyCounter">Remaining: 0</div>
+</div>
+
+<div id="choices"></div>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/*
+TODO:
+1. Add life system so player don't immediately lose. (Though it's fine if I want this game to be more hardcore)
+2. Buff other items since Jammer is pretty overpowered compared to other items right now.
+3. Maybe add more items. If not then I probably should get rid off shuffling item choices.
+4. Fix the damn code since the code quality is TRASH (I guess that's what happen when you don't enforce code quality while using AI for coding)
+4.1. Get rid off one liner function (cough, helpers function)
+4.2. Use proper spacing
+4.3. Use actual clear name for variables (looking at you, e)
+4.4. Get rid off all the magic constants and turn it into proper config variables (ESPECIALLY those in the updateEnemies() function)
+5. Add weighted balancing for enemy type spawning so the game doesn't spam enemies that are troublesome to handle like dashers or armored.
+*/
+
+/* ================= CONFIG ================= */
+const BOMB_RADIUS = 200;            // configurable bomb radius (px)
+const BOMB_DAMAGE = 9999;              // how many hits the bomb counts as (set to 9999 for instant kill)
+const JAMMER_SLOW_FACTOR = 0.4;     // enemies move at this fraction when jammed
+const JAMMER_DURATION = 3000;       // ms
+const PROJECTILE_SPEED = 12;         // px per frame
+const TURRET_DURATION = 600;        // frames (approx 10s at 60fps)
+const TURRET_COOLDOWN_FRAMES = 15;  // frames between shots
+const MAX_TURRET_DISTANCE = 300;    // turret engagement radius
+const TURRET_TARGET_CHECK_FRAMES = 15; // 0.25s at ~60fps
+
+const ENEMY_PROTECT_RADIUS = 150;        // radius within which protector enemies can protect others
+/* ======================================== */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+function resize(){canvas.width=window.innerWidth;canvas.height=window.innerHeight}
+window.addEventListener('resize', resize); resize();
+
+// The player's center point and hitbox radius
+const center = { 
+  x: canvas.width/2, 
+  y: canvas.height/2, 
+  radius: 25 
+};
+
+// Game state
+let round = 1;
+let enemies = [];
+let projectiles = [];
+let effects = []; // generic visual effects
+let turret = null; // {time, cooldown, target, targetCheckTimer}
+
+let baseSpawnInterval = 1000; // ms (will be set at start of round)
+let spawnTimer = null;
+let spawned = 0;
+let killed = 0;
+let maxEnemies = 5;
+
+let state = 'choice'; // 'choice' or 'playing'
+
+let inventory = { bomb:0, jammer:0, turret:0 };
+let selectedItem = null; // 'bomb'|'jammer'|'turret' or null
+let jammerActive = false;
+let jammerTimeout = null;
+
+let pendingClicks = [];
+let mouseX = 0, mouseY = 0;
+
+/* ----------------- Helpers ----------------- */
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function distance(ax,ay,bx,by){return Math.hypot(ax-bx,ay-by)}
+function attackEnemy(e, damage = 1) {
+  if (e.dead) return;
+  e.health -= damage;
+  if (e.health <= 0) {
+    e.dead = true;
+    e.shrinkTimer = 15; // frames
+    killed++;
+    updateEnemyCounter();
+  } else {
+    enemyHit(e);
+  }
+}
+
+/* ---------- Enemy type rules ----------
+basic: speed 1 (round 1-3)
+fast: speed 2 (round 2-8)
+strafe: speed 2, angularSpeedFactor 1, lose angularSpeedFactor with distance (round 5+)
+tiny: speed 2, size 10 (round 7-13)
+armored: speed 1.5, size 20, health 2, turn into speed 4 when hit (round 9+)
+rusher: speed 2, size 10, maxSpeedMultiplier of 8, minDistance 300, distanceOffset 300 (round 11+)
+homing: speed 1.5, angularSpeedFactor 4, specialTimer 300 to lose homing ability but set speed to 3 (round 13+)
+dasher: speed 1.5, size 10, dashSpeedMultiplier 8, dashTime 15 frames, triggerRadius 100, specialTimer to control dash timing (round 15+)
+protector: speed 2, protectRadius 100, prevent other non-protector enemies from getting hit within protection radius (round 17+)
+
+size default 15
+health default 1
+hitboxSize = min(visual*1.2, visual+4)
+---------------------------------------*/
+function getAvailableTypes(){
+  const types = [];
+  if (round <= 3) types.push('basic');
+  if (round >= 2 && round <= 8) types.push('fast');
+  if (round >= 5) types.push('strafe');
+  if (round >= 7 && round <= 12) types.push('tiny');
+  if (round >= 9) types.push('armored');
+  if (round >= 11) types.push('rusher');
+  if (round >= 13) types.push('homing');
+  if (round >= 15) types.push('dasher');
+  if (round >= 17) types.push('protector');
+  return types;
+}
+
+function randomEdgePosition(){
+  const s = Math.floor(Math.random()*4);
+  if (s===0) return {x:Math.random()*canvas.width, y:0};
+  if (s===1) return {x:canvas.width, y:Math.random()*canvas.height};
+  if (s===2) return {x:Math.random()*canvas.width, y:canvas.height};
+  return {x:0, y:Math.random()*canvas.height};
+}
+
+// This function is triggered when an enemy is hit, but not killed.
+function enemyHit(e) {
+  if (e.type === 'armored' && e.health === 1) {
+    e.speed = 4;
+    e.color = 'darkgray'; // change color to indicate damaged state
+  }
+}
+
+function spawnEnemy(){
+  if (spawned >= maxEnemies) return;
+  const pos = randomEdgePosition();
+  const types = getAvailableTypes();
+  const type = types[Math.floor(Math.random()*types.length)];
+
+  let speed = 1;
+  let size = 15;
+  let health = 1;
+  let angularSpeedFactor = 0;
+  let color = "red";
+  let specialEnabled = false;
+  if (type === 'fast') {
+    speed = 2;
+    color = 'orange';
+  }
+  if (type === 'strafe') {
+    speed = 2;
+    angularSpeedFactor = 1;
+    color = 'purple';
+  }
+  if (type === 'tiny') { 
+    speed = 2; 
+    size = 10; 
+    color = 'cyan'; 
+  }
+  if (type === 'rusher') {
+    speed = 2;
+    size = 10;
+    color = 'white';
+  }
+  if (type === 'armored') {
+    speed = 1.5; 
+    health = 2;
+    size = 20;
+    color = 'gray';
+  }
+  if (type === 'homing') {
+    speed = 1.5;
+    angularSpeedFactor = 4;
+    specialEnabled = true;
+    color = 'magenta';
+  }
+  if (type === 'dasher') {
+    speed = 1.5;
+    size = 10;
+    specialEnabled = true;
+    color = 'lime';
+  }
+  if (type === 'protector') {
+    speed = 2;
+    color = 'blue';
+  }
+
+  const hitboxSize = Math.min(size * 1.2, size + 4);
+
+  enemies.push({
+    x: pos.x,
+    y: pos.y,
+    type,
+    speed,
+    size,
+    health,
+    angularSpeedFactor,
+    hitboxSize,
+    dead: false,
+    shrinkTimer: 0,
+    specialTimer: 0, // for special behaviors like homing update frequency or dash timing
+    specialEnabled,
+    color,
+  });
+
+  effects.push({
+    type: 'spawnFlash',
+    x: pos.x,
+    y: pos.y,
+    size: size * 5,
+    life: 60,
+    maxLife: 20,
+    color,
+  });
+
+  spawned++;
+  updateEnemyCounter();
+}
+
+function setSpawnInterval(ms){
+  if (spawnTimer) clearInterval(spawnTimer);
+  spawnTimer = setInterval(spawnEnemy, ms);
+}
+
+/* ---------------- Items & UI -------------- */
+const labelBomb = document.getElementById('label-bomb');
+const labelJammer = document.getElementById('label-jammer');
+const labelTurret = document.getElementById('label-turret');
+const countBomb = document.getElementById('count-bomb');
+const countJammer = document.getElementById('count-jammer');
+const countTurret = document.getElementById('count-turret');
+
+function updateInventoryUI(){
+  countBomb.innerText = inventory.bomb;
+  countJammer.innerText = inventory.jammer;
+  countTurret.innerText = inventory.turret;
+
+  // color selected label green; otherwise white
+  labelBomb.style.color = selectedItem === 'bomb' ? 'limegreen' : 'white';
+  labelJammer.style.color = selectedItem === 'jammer' ? 'limegreen' : 'white';
+  labelTurret.style.color = selectedItem === 'turret' ? 'limegreen' : 'white';
+}
+
+function updateEnemyCounter(){
+  const rem = Math.max(0, maxEnemies - killed);
+  document.getElementById('enemyCounter').innerText = 'Remaining: ' + rem;
+}
+
+/* ------------- Click handling ------------- */
+canvas.addEventListener('mousemove', e=>{
+  const r = canvas.getBoundingClientRect();
+  mouseX = e.clientX - r.left; mouseY = e.clientY - r.top;
+});
+canvas.addEventListener('click', e=>{
+  if (state !== 'playing') return; // clicks outside playing do nothing
+  const r = canvas.getBoundingClientRect();
+  pendingClicks.push({ x: e.clientX - r.left, y: e.clientY - r.top });
+});
+
+function isProtected(targetEnemy) {
+  for (let e of enemies) {
+    if ((e.type !== 'protector') || e.dead) continue;
+    if (distance(e.x,e.y,targetEnemy.x,targetEnemy.y) < ENEMY_PROTECT_RADIUS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function processPendingClicks(){
+  while (pendingClicks.length){
+    const {x:mx,y:my} = pendingClicks.shift();
+
+    // Create a hitmarker effect where the player clicks.
+    effects.push({
+      type: 'hitMarker',
+      x: mx,
+      y: my,
+      size: 12,
+      life: 10,
+      maxLife: 10
+    });
+
+    // Bomb deploy
+    if (selectedItem === 'bomb' && inventory.bomb > 0){
+      let removed = 0;
+      for (let i=enemies.length-1;i>=0;i--){
+        if (distance(enemies[i].x,enemies[i].y, mx, my) < BOMB_RADIUS){
+          attackEnemy(enemies[i], BOMB_DAMAGE);
+        }
+      }
+
+      // Create a explosion visual effect
+      effects.push({
+        type: 'bomb',
+        x: mx,
+        y: my,
+        radius: 0,
+        maxRadius: BOMB_RADIUS,
+        life: 20,
+        maxLife: 20
+      });
+
+      inventory.bomb--; 
+      selectedItem = null; 
+      updateInventoryUI();
+      continue;
+    }
+
+    // Jammer deploy
+    if (selectedItem === 'jammer' && inventory.jammer > 0){
+      activateJammer(JAMMER_DURATION);
+      inventory.jammer--; selectedItem = null; updateInventoryUI();
+      continue;
+    }
+
+    // Turret deploy (creates turret at center)
+    if (selectedItem === 'turret' && inventory.turret > 0){
+      turret = { time: TURRET_DURATION, cooldown: 0, target: null, targetCheckTimer: 0 };
+      inventory.turret--; selectedItem = null; updateInventoryUI();
+      continue;
+    }
+    
+    // Normal click: attempt to hit enemies using hitboxSize
+    for (let i=enemies.length-1;i>=0;i--){
+      if (distance(enemies[i].x, enemies[i].y, mx, my) < enemies[i].hitboxSize){
+        if (!isProtected(enemies[i]) || enemies[i].type === 'protector') {
+          attackEnemy(enemies[i]);
+        } else {
+          // If the enemy is protected, create a "protected" effect instead of hitting it.
+          effects.push({
+            type: 'protectedHit',
+            x: mx,
+            y: my,
+            radius: 0,
+            maxRadius: enemies[i].size * 2,
+            life: 15,
+            maxLife: 15
+          });
+        }
+        break;
+      }
+    }
+  }
+}
+
+/* --------------- Jammer logic -------------- */
+function activateJammer(durationMs){
+  // if already active, clear previous timeout and restart duration
+  if (jammerTimeout) clearTimeout(jammerTimeout);
+  jammerActive = true;
+  // slow spawn rate by same percentage: spawn interval becomes base / JAMMER_SLOW_FACTOR (less frequent)
+  setSpawnInterval(baseSpawnInterval / JAMMER_SLOW_FACTOR);
+  
+  jammerTimeout = setTimeout(()=>{
+    jammerActive = false; jammerTimeout = null;
+    setSpawnInterval(baseSpawnInterval);
+  }, durationMs);
+}
+
+/* --------------- Turret & projectiles --------------- */
+function updateTurret(){
+  if (!turret) return;
+
+  turret.time--;
+  if (turret.time <= 0){ turret = null; return; }
+
+  // If current target is dead or out of radius, clear immediately
+  if (turret.target){
+    const stillExists = enemies.includes(turret.target);
+    if (!stillExists || distance(center.x, center.y, turret.target.x, turret.target.y) > MAX_TURRET_DISTANCE){
+      turret.target = null;
+      turret.targetCheckTimer = 0; // immediate retarget next frame
+    }
+  }
+
+  // Target acquisition (only every 0.5s OR immediately if no target)
+  if (!turret.target){
+    if (turret.targetCheckTimer > 0){
+      turret.targetCheckTimer--;
+    } else {
+      let candidates = [];
+      for (let e of enemies){
+        const d = distance(center.x, center.y, e.x, e.y);
+        if (d <= MAX_TURRET_DISTANCE){
+          candidates.push({ enemy: e, dist: d });
+        }
+      }
+      if (candidates.length > 0){
+        candidates.sort((a,b)=>a.dist-b.dist);
+        turret.target = candidates[0].enemy;
+      }
+      turret.targetCheckTimer = TURRET_TARGET_CHECK_FRAMES;
+    }
+  }
+
+  // Firing logic
+  if (turret.cooldown > 0) turret.cooldown--;
+  if (turret.cooldown <= 0 && turret.target){
+    const nx = turret.target.x - center.x;
+    const ny = turret.target.y - center.y;
+    const nd = Math.hypot(nx,ny) || 1;
+    const vx = (nx/nd) * PROJECTILE_SPEED;
+    const vy = (ny/nd) * PROJECTILE_SPEED;
+    projectiles.push({ x: center.x, y: center.y, vx, vy });
+    turret.cooldown = TURRET_COOLDOWN_FRAMES;
+  }
+}
+
+function updateProjectiles(){
+  for (let i = projectiles.length -1;i>=0;i--){
+    const p = projectiles[i];
+    p.x += p.vx; p.y += p.vy;
+    // off-screen
+    if (p.x < 0 || p.x > canvas.width || p.y < 0 || p.y > canvas.height){ projectiles.splice(i,1); continue; }
+    
+    // hit test: only destroy one enemy
+    let hit = false;
+    for (let j=enemies.length-1;j>=0;j--){
+      if (distance(enemies[j].x,enemies[j].y, p.x, p.y) < enemies[j].hitboxSize){
+        attackEnemy(enemies[j]);
+        hit = true; 
+        break;
+      }
+    }
+    // Destroy projectile on hit.
+    if (hit) {
+      projectiles.splice(i,1);
+    };
+  }
+}
+
+/* ------------ Enemy update & drawing ----------- */
+function updateEnemies(){
+  for (let e of enemies){
+    if (e.dead) continue;
+
+    // Update special timer 
+    // (Used for behaviors that don't need every-frame updates, like homing direction adjustment or dash timing)
+    if (e.specialEnabled && !jammerActive) {
+      e.specialTimer++;
+    }
+
+    const dx = center.x - e.x;
+    const dy = center.y - e.y;
+    const dist = Math.hypot(dx,dy) || 1;
+    const nx = dx/dist;
+    const ny = dy/dist;
+
+    let moveSpeed = e.speed * (jammerActive ? JAMMER_SLOW_FACTOR : 1);
+    let speedMultiplier = 1;
+    let angularSpeedFactor = e.angularSpeedFactor
+    let angularSpeed = moveSpeed;
+    const perpX = -ny;
+    const perpY = nx;
+    
+    // Custom behavior for each enemy type:
+    if (e.type === 'strafe'){
+      const distanceFactor = Math.min(1, dist / 300);
+      angularSpeedFactor = angularSpeedFactor * distanceFactor;
+    } else if (e.type === 'rusher') {
+      const distanceFactor = clamp((dist - 300) / 300, 0, 1);
+      const rushFactor = 1 + (7 * distanceFactor);
+      speedMultiplier = rushFactor;
+    } else if (e.type === 'homing') {
+      if (e.specialTimer >= 300) {
+        e.specialEnabled = false;
+        e.specialTimer = 0;
+        e.speed = 3;
+        e.angularSpeedFactor = 0;
+
+        effects.push({
+          type: 'homingFlash',
+          x: e.x,
+          y: e.y,
+          radius: 0,
+          maxRadius: 100,
+          life: 30,
+          maxLife: 30
+      });
+      }
+    } else if (e.type === 'dasher') {
+      let dashTime = 15;
+      let dashSpeedMultiplier = 8;
+      let triggerRadius = 100;
+
+      // If the dash timer is below 0, the enemy is dashing backward,
+      // Otherwise, if the dash timer is around 60-120, check if the cursor is close to trigger the dash,
+      // Otherwise, if the dash timer is above 120, the enemy is dashing forward.
+      // Otherwise, the enemy is in normal state.
+      if (!jammerActive) {
+        if (e.specialTimer < 0) {
+          speedMultiplier = -dashSpeedMultiplier;
+          effects.push({
+            type: 'dashAfterimage',
+            x: e.x,
+            y: e.y,
+            radius: e.size,
+            maxRadius: e.size,
+            life: 15,
+            maxLife: 15
+          });
+        } else if (e.specialTimer >= 0 && e.specialTimer < 60) {
+          // Normal state, do nothing
+        } else if (e.specialTimer >= 60 && e.specialTimer <= 120) {
+          let cursorDist = distance(e.x, e.y, mouseX, mouseY)
+          if (cursorDist <= triggerRadius) {
+            e.specialTimer = -dashTime;
+          }
+        } else {
+          speedMultiplier = dashSpeedMultiplier;
+          effects.push({
+            type: 'dashAfterimage',
+            x: e.x,
+            y: e.y,
+            radius: e.size,
+            maxRadius: e.size,
+            life: 15,
+            maxLife: 15
+          });
+          if (e.specialTimer > (120 + dashTime)) {
+            e.specialTimer = 0;
+          }
+        }
+      }
+    } else {
+      // Do nothing.
+    }
+
+    e.x += (nx * moveSpeed * speedMultiplier) + (perpX * (angularSpeed * angularSpeedFactor));
+    e.y += (ny * moveSpeed * speedMultiplier) + (perpY * (angularSpeed * angularSpeedFactor));
+
+    if (dist < center.radius){
+      gameOver();
+      return;
+    }
+  }
+}
+
+/* ----------------- Round logic ------------------ */
+function startRound(){
+  state = 'playing';
+  spawned = 0; killed = 0; enemies = []; projectiles = [];
+  turret = null; // turret cannot be carried over
+  selectedItem = null; updateInventoryUI();
+
+  let roundWithOffset = round - 1; // so that round 1 starts with 5 enemies and 1000ms spawn interval
+  maxEnemies = 5 + (roundWithOffset * 2);
+  baseSpawnInterval = Math.max(400, 1000 - roundWithOffset * Math.max(100 - roundWithOffset * 5, 40));
+  // Due to how the formula works: 
+  // 1. The spawn interval actually increases during round 10-12
+  // 2. After round 12, the spawn interval stabilizes and continue as normal.
+  // 3. The spawn interval hit the minimum cap (400ms) at round 15
+  setSpawnInterval(baseSpawnInterval);
+  document.getElementById('roundText').innerText = 'Round ' + round;
+  updateEnemyCounter();
+}
+
+function endRound(){
+  // force unselect and reset turret (already null in our flow), but ensure cooldowns not carried
+  selectedItem = null; updateInventoryUI();
+  if (spawnTimer) clearInterval(spawnTimer); spawnTimer = null;
+  // present choices
+  showChoices();
+}
+
+function showChoices(){
+  state = 'choice';
+  selectedItem = null; updateInventoryUI();
+  const div = document.getElementById('choices'); div.innerHTML=''; div.style.display='block';
+  const items = ['bomb','jammer','turret'];
+  // shuffle and show three options (unique)
+  const shuffled = items.sort(()=>0.5 - Math.random());
+  for (let it of shuffled.slice(0,3)){
+    const btn = document.createElement('div'); btn.className='choice'; btn.innerText = it.toUpperCase();
+    btn.onclick = ()=>{ inventory[it]++; updateInventoryUI(); div.style.display='none'; startRound(); };
+    div.appendChild(btn);
+  }
+}
+
+/* --------------- Input (item select) -------------- */
+window.addEventListener('keydown', e=>{
+  if (state !== 'playing') return; // cannot select during choice phase
+  if (e.key === '1' && inventory.bomb > 0){ selectedItem = selectedItem === 'bomb' ? null : 'bomb'; updateInventoryUI(); }
+  if (e.key === '2' && inventory.jammer > 0){ selectedItem = selectedItem === 'jammer' ? null : 'jammer'; updateInventoryUI(); }
+  if (e.key === '3' && inventory.turret > 0){ selectedItem = selectedItem === 'turret' ? null : 'turret'; updateInventoryUI(); }
+});
+
+/* ----------------- Game over -------------------- */
+let gameOverFlag = false;
+function gameOver(){ gameOverFlag = true; if (spawnTimer) clearInterval(spawnTimer); spawnTimer = null; }
+
+/* ---------------- Main loop -------------------- */
+function draw() {
+  // Make dead enemy shrinks (visual effect)
+  for (let i = enemies.length - 1; i >= 0; i--){
+    const e = enemies[i];
+    if (e.dead){
+      e.shrinkTimer--;
+      e.size *= 0.8;
+      if (e.shrinkTimer <= 0){
+        enemies.splice(i,1);
+      }
+    }
+  }
+
+  // draw enemies
+  for (let e of enemies){
+    ctx.fillStyle = e.color;
+    ctx.beginPath(); 
+    ctx.arc(e.x, e.y, e.size, 0, Math.PI*2); 
+    ctx.fill();
+
+    if (e.type === 'protector' && !e.dead) {
+      // Draw protection radius
+      ctx.save();
+      ctx.globalAlpha = 0.2;
+      ctx.strokeStyle = 'blue';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, ENEMY_PROTECT_RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // draw projectiles
+  ctx.fillStyle = 'yellow';
+  for (let p of projectiles) { 
+    ctx.beginPath(); 
+    ctx.arc(p.x, p.y, 4, 0, Math.PI*2); 
+    ctx.fill(); 
+  }
+
+  // Update visual effect
+  for (let ef of effects){
+    const alpha = ef.life / ef.maxLife;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    if (ef.type === 'hitMarker'){
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(ef.x - ef.size, ef.y);
+      ctx.lineTo(ef.x + ef.size, ef.y);
+      ctx.moveTo(ef.x, ef.y - ef.size);
+      ctx.lineTo(ef.x, ef.y + ef.size);
+      ctx.stroke();
+    }
+
+    if (ef.type === 'spawnFlash'){
+      ctx.strokeStyle = ef.color;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(
+        ef.x - ef.size/2,
+        ef.y - ef.size/2,
+        ef.size,
+        ef.size
+      );
+    }
+
+    if (ef.type === 'dashAfterimage'){
+      ctx.strokeStyle = 'lime';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, ef.radius, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    if (ef.type === 'bomb'){
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, ef.radius, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    if (ef.type === 'homingFlash'){
+      ctx.strokeStyle = 'magenta';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, ef.radius, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    if (ef.type === 'protectedHit'){
+      ctx.strokeStyle = 'dodgerblue';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, ef.radius, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+  
+  // draw active turret radius indicator
+  if (turret){
+    const lifeRatio = Math.max(0, turret.time / TURRET_DURATION);
+    ctx.save();
+    ctx.globalAlpha = 0.35 * lifeRatio; // fades as lifetime decreases
+    ctx.strokeStyle = 'yellow';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, MAX_TURRET_DISTANCE, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function gameLoop(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // draw center
+  ctx.fillStyle = 'dodgerblue'; ctx.beginPath(); ctx.arc(center.x, center.y, center.radius, 0, Math.PI*2); ctx.fill();
+
+  if (state === 'playing'){
+    // process input BEFORE enemies move
+    processPendingClicks();
+
+    updateEnemies();
+    updateTurret();
+    updateProjectiles();
+    
+    // Update effect length. (Special case handling for bomb visualEffect type)
+    for (let i = effects.length - 1; i >= 0; i--){
+      const ef = effects[i];
+      ef.life--;
+
+      if (ef.type === 'bomb') {
+        ef.radius += ef.maxRadius / ef.maxLife;
+      }
+      if (ef.type === 'homingFlash') {
+        ef.radius += ef.maxRadius / ef.maxLife;
+      }
+      if (ef.type === 'protectedHit') {
+        ef.radius += ef.maxRadius / ef.maxLife;
+      }
+
+      if (ef.life <= 0){
+        effects.splice(i,1);
+      }
+    }
+
+    draw();
+
+    // check round end: all enemies spawned and killed
+    if (killed >= maxEnemies){ // all enemies for this round destroyed
+      // end round
+      round++; endRound();
+    }
+  }
+
+  // bomb preview when selected
+  if (selectedItem === 'bomb' && state === 'playing'){
+    ctx.save(); ctx.globalAlpha = 0.25; ctx.fillStyle = 'red'; ctx.beginPath(); ctx.arc(mouseX, mouseY, BOMB_RADIUS, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  }
+
+  // turret preview when selected (more visible than active indicator)
+  if (selectedItem === 'turret' && state === 'playing'){
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = 'yellow';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, MAX_TURRET_DISTANCE, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (gameOverFlag){
+    ctx.fillStyle = 'white'; ctx.font = '48px Arial'; ctx.textAlign='center'; ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2);
+    return; // stop loop
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// initialize
+updateInventoryUI(); 
+showChoices(); 
+gameLoop();
+
+</script>
+</body>
+</html>
